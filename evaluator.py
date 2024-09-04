@@ -173,6 +173,45 @@ class Evaluator:
 
         return rwkv_model, rwkv_tokenizer
 
+    def load_rwkv_mlc(self, config: EvaluationConfig):
+        os.environ['RWKV_JIT_ON'] = '1'
+        os.environ["RWKV_CUDA_ON"] = '1'
+
+        from rwkv.utils import PIPELINE
+        from mlc_llm_rwkv_eval import DebugChat
+
+        model = config.model_name_or_path
+        model_lib = model + "/libs/model.so"
+        if config.model_args.get('model_lib') is not None:
+            model_lib = config.model_args.get('model_lib')
+
+        rwkv_model = DebugChat(
+            model,
+            model_lib=model_lib,
+        )
+
+        rwkv_pipeline = PIPELINE(None, config.tokenizer_name)
+        rwkv_tokenizer = rwkv_pipeline.tokenizer
+
+        return rwkv_model, rwkv_tokenizer
+    
+    def load_llama_cpp(self, config: EvaluationConfig):
+        import llama_cpp
+        import ctypes
+
+        model = config.model_name_or_path
+
+        llama_cpp.llama_backend_init(False) # Must be called once at the start of each program
+        lparams = llama_cpp.llama_model_default_params()
+        cparams = llama_cpp.llama_context_default_params()
+        lparams.n_gpu_layers = 99
+        cparams.n_ctx = 4096
+        cparams.logits_all = True
+        model = llama_cpp.llama_load_model_from_file(model.encode("utf-8"), lparams)
+        ctx = llama_cpp.llama_new_context_with_model(model, cparams)
+
+        return llama_cpp, model, ctx
+
     def load_mamba(self, config: EvaluationConfig):
         # state-spaces/mamba-2.8b-slimpj
         # pip install mamba-ssm
@@ -266,6 +305,115 @@ class Evaluator:
             'avg tokens': sum(rwkv_token_length_list) / len(rwkv_token_length_list),
             'avg character count': sum(char_count) / len(char_count),
             'parameters count': self.count_rwkv_parameters_in_billions(model),
+            'avg bytes': sum([self.get_string_byte_size(text) for text in texts]) / len(texts),
+            'sample_count': len(texts)
+        }
+
+        # print(f'log probability sum: {sum(rwkv_test_data) / len(rwkv_test_data):.2f}')
+        # print(f'avg tokens: {sum(rwkv_token_length_list) / len(rwkv_token_length_list):.0f}')
+
+        return data_dict
+    
+    def eval_rwkv_mlc(self, model, tokenizer, texts, chunk_size):
+        rwkv_test_data = []
+        rwkv_token_length_list = []
+        char_count = []
+
+        for idx, sample in tqdm(enumerate(texts), total=len(texts)):
+
+            char_count.append(len(sample))
+
+            with torch.no_grad():
+
+                tokenized = tokenizer.encode(sample)
+                if hasattr(tokenized, 'ids'):
+                    input_seq = tokenized.ids  # RWKV v4pile
+                else:
+                    input_seq = tokenized  # RWKV world
+
+                input_length = len(input_seq)
+
+                neg_log_prob_temp = 0
+                for begin in range(0, input_length, chunk_size):
+                    input_chunk = input_seq[begin: begin + chunk_size]
+
+                    # logit = model.forward(input_chunk, None, full_output=True)[0]
+                    logit = model.full_output_ids(input_chunk)
+                    logit = torch.from_numpy(logit).cuda().squeeze()
+
+                    if len(input_chunk) == 1:
+                        logit = logit.unsqueeze(0)
+
+                    log_sum = self.calculate_log_sum(logit, torch.tensor(input_chunk).cuda())
+
+                    neg_log_prob_temp += log_sum
+
+                rwkv_token_length_list.append(input_length)
+                rwkv_test_data.append(neg_log_prob_temp)
+
+        data_dict = {
+            'neg_log_prob_sum': sum(rwkv_test_data) / len(rwkv_test_data),
+            'avg tokens': sum(rwkv_token_length_list) / len(rwkv_token_length_list),
+            'avg character count': sum(char_count) / len(char_count),
+            'parameters count': 1.6,#self.count_rwkv_parameters_in_billions(model),
+            'avg bytes': sum([self.get_string_byte_size(text) for text in texts]) / len(texts),
+            'sample_count': len(texts)
+        }
+
+        # print(f'log probability sum: {sum(rwkv_test_data) / len(rwkv_test_data):.2f}')
+        # print(f'avg tokens: {sum(rwkv_token_length_list) / len(rwkv_token_length_list):.0f}')
+
+        return data_dict
+
+    def eval_llama_cpp(self, llama_cpp, model, ctx, texts, chunk_size):
+        rwkv_test_data = []
+        rwkv_token_length_list = []
+        char_count = []
+        import numpy as np
+
+        for idx, sample in tqdm(enumerate(texts), total=len(texts)):
+
+            char_count.append(len(sample))
+
+            with torch.no_grad():
+                embd_inp = (llama_cpp.llama_token * (len(sample) + 1))()
+                # tokenized = tokenizer.encode(sample)
+                n_tokenized = llama_cpp.llama_tokenize(
+                    model,
+                    bytes(str(sample), "utf-8"),
+                    len(bytes(str(sample), "utf-8")),
+                    embd_inp,
+                    len(embd_inp),
+                    False,
+                    False
+                )
+                input_seq = [embd_inp[i] for i in range(n_tokenized)]
+                input_length = len(input_seq)
+
+                neg_log_prob_temp = 0
+                for begin in range(0, input_length, chunk_size):
+                    input_chunk = input_seq[begin: begin + chunk_size]
+                    llama_cpp.llama_kv_cache_clear(ctx)
+                    llama_cpp.llama_decode(ctx, llama_cpp.llama_batch_get_one(embd_inp, len(input_chunk), begin, 0))
+                    logit_ctype = llama_cpp.llama_get_logits(ctx)
+                    logit = np.ctypeslib.as_array(logit_ctype, (len(input_chunk) * 65536,))
+                    logit = torch.from_numpy(np.array(logit)).cuda().squeeze().reshape(len(input_chunk), 65536)
+
+                    if len(input_chunk) == 1:
+                        logit = logit.unsqueeze(0)
+
+                    log_sum = self.calculate_log_sum(logit, torch.tensor(input_chunk).cuda())
+
+                    neg_log_prob_temp += log_sum
+
+                rwkv_token_length_list.append(input_length)
+                rwkv_test_data.append(neg_log_prob_temp)
+
+        data_dict = {
+            'neg_log_prob_sum': sum(rwkv_test_data) / len(rwkv_test_data),
+            'avg tokens': sum(rwkv_token_length_list) / len(rwkv_token_length_list),
+            'avg character count': sum(char_count) / len(char_count),
+            'parameters count': llama_cpp.llama_model_n_params(model) / 1e9,
             'avg bytes': sum([self.get_string_byte_size(text) for text in texts]) / len(texts),
             'sample_count': len(texts)
         }
@@ -471,6 +619,10 @@ class Evaluator:
             model, tokenizer = self.load_rwkv(config)
         elif config.model_type == 'mamba':
             model, tokenizer = self.load_mamba(config)
+        elif config.model_type == 'rwkv_mlc':
+            model, tokenizer = self.load_rwkv_mlc(config)
+        elif config.model_type == 'llama_cpp':
+            llama_cpp, model, ctx = self.load_llama_cpp(config)
         else:
             raise NotImplementedError
 
@@ -502,6 +654,10 @@ class Evaluator:
                                                  )
             elif config.model_type == 'rwkv':
                 results = self.eval_rwkv(model=model, tokenizer=tokenizer, texts=texts, chunk_size=config.chunk_size)
+            elif config.model_type == 'rwkv_mlc':
+                results = self.eval_rwkv_mlc(model=model, tokenizer=tokenizer, texts=texts, chunk_size=config.chunk_size)
+            elif config.model_type == 'llama_cpp':
+                results = self.eval_llama_cpp(llama_cpp=llama_cpp, model=model, ctx=ctx, texts=texts, chunk_size=config.chunk_size)
             else:
                 raise NotImplementedError
 
