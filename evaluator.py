@@ -371,7 +371,7 @@ class Evaluator:
         char_count = []
         import numpy as np
 
-        n_embd = llama_cpp.llama_n_embd(model)
+        n_vocab = llama_cpp.llama_n_vocab(model)
 
         for idx, sample in tqdm(enumerate(texts), total=len(texts)):
 
@@ -401,8 +401,8 @@ class Evaluator:
                     llama_cpp.llama_kv_cache_clear(ctx)
                     llama_cpp.llama_decode(ctx, llama_cpp.llama_batch_get_one(input_chunk_ctype, len(input_chunk), 0, 0))
                     logit_ctype = llama_cpp.llama_get_logits(ctx)
-                    logit = np.ctypeslib.as_array(logit_ctype, (len(input_chunk) * n_embd,))
-                    logit = torch.from_numpy(logit.squeeze().reshape(len(input_chunk), n_embd))
+                    logit = np.ctypeslib.as_array(logit_ctype, (len(input_chunk) * n_vocab,))
+                    logit = torch.from_numpy(logit.squeeze().reshape(len(input_chunk), n_vocab))
 
                     if len(input_chunk) == 1:
                         logit = logit.unsqueeze(0)
