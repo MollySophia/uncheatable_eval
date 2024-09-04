@@ -371,6 +371,8 @@ class Evaluator:
         char_count = []
         import numpy as np
 
+        n_embd = llama_cpp.llama_n_embd(model)
+
         for idx, sample in tqdm(enumerate(texts), total=len(texts)):
 
             char_count.append(len(sample))
@@ -393,16 +395,19 @@ class Evaluator:
                 neg_log_prob_temp = 0
                 for begin in range(0, input_length, chunk_size):
                     input_chunk = input_seq[begin: begin + chunk_size]
+                    input_chunk_ctype = (llama_cpp.llama_token * (len(input_chunk) + 1))()
+                    for i, token in enumerate(input_chunk):
+                        input_chunk_ctype[i] = token
                     llama_cpp.llama_kv_cache_clear(ctx)
-                    llama_cpp.llama_decode(ctx, llama_cpp.llama_batch_get_one(embd_inp, len(input_chunk), begin, 0))
+                    llama_cpp.llama_decode(ctx, llama_cpp.llama_batch_get_one(input_chunk_ctype, len(input_chunk), 0, 0))
                     logit_ctype = llama_cpp.llama_get_logits(ctx)
-                    logit = np.ctypeslib.as_array(logit_ctype, (len(input_chunk) * 65536,))
-                    logit = torch.from_numpy(np.array(logit)).cuda().squeeze().reshape(len(input_chunk), 65536)
+                    logit = np.ctypeslib.as_array(logit_ctype, (len(input_chunk) * n_embd,))
+                    logit = torch.from_numpy(logit.squeeze().reshape(len(input_chunk), n_embd))
 
                     if len(input_chunk) == 1:
                         logit = logit.unsqueeze(0)
 
-                    log_sum = self.calculate_log_sum(logit, torch.tensor(input_chunk).cuda())
+                    log_sum = self.calculate_log_sum(logit.cuda(), torch.tensor(input_chunk).cuda())
 
                     neg_log_prob_temp += log_sum
 
